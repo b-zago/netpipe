@@ -5,7 +5,7 @@ CLI for uploading to and downloading from a personal netpipe server on AWS. Para
 ## Install
 
 ```
-pipx install git+https://github.com/you/netpipe
+pipx install git+https://github.com/b-zago/netpipe
 ```
 
 Requires Python 3.10+ and [pipx](https://pipx.pypa.io/).
