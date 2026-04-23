@@ -4,6 +4,7 @@
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import click
@@ -104,29 +105,37 @@ def init(endpoint, access_key, default_folder):
 @cli.command()
 @click.argument("file_path", type=click.Path(exists=True, dir_okay=False, readable=True))
 @click.option("--folder", "-f", default=None, help="Shared folder to upload into.")
+@click.option("--workers", "-w", default=None, type=click.IntRange(min=1), help="Parallel upload workers (default 8).")
 @handle_errors
-def send(file_path, folder):
+def send(file_path, folder, workers):
     """Upload a file to a shared folder."""
     config = load_config()
     folder = folder or config["default_folder"]
+    kwargs = {"workers": workers} if workers is not None else {}
 
-    api.upload_file(config["endpoint"], config["access_key"], folder, file_path)
-    click.echo(f"Uploaded {file_path} to {folder}")
+    t0 = time.monotonic()
+    api.upload_file(config["endpoint"], config["access_key"], folder, file_path, **kwargs)
+    elapsed = time.monotonic() - t0
+    click.echo(f"Uploaded {file_path} to {folder} in {elapsed:.1f}s")
 
 @cli.command()
 @click.argument("filename")
 @click.option("--folder", "-f", default=None, help="Shared folder to download from.")
 @click.option("--output", "-o", type=click.Path(), help="Where to save the file.")
+@click.option("--workers", "-w", default=None, type=click.IntRange(min=1), help="Parallel download workers (default 8).")
 @handle_errors
-def get(filename, folder, output):
+def get(filename, folder, output, workers):
     """Download a file."""
     config = load_config()
     folder = folder or config["default_folder"]
     output = output or filename
+    kwargs = {"workers": workers} if workers is not None else {}
 
+    t0 = time.monotonic()
     data = api.get_download_parts(config["endpoint"], config["access_key"], folder, filename)
-    api.download_file(data, output)
-    click.echo(f"Downloaded {filename} from {folder}")
+    api.download_file(data, output, **kwargs)
+    elapsed = time.monotonic() - t0
+    click.echo(f"Downloaded {filename} from {folder} in {elapsed:.1f}s")
 
 @cli.command()
 @click.argument("folder", required=False)

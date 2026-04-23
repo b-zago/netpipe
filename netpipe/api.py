@@ -11,17 +11,17 @@ import requests
 # HTTPS enforcement check, and presigned URL hosts that come back as raw
 # container IPs get rewritten to localhost. Default is False (prod-safe).
 DEV = os.environ.get("NETPIPE_DEV", "").lower() in ("1", "true", "yes")
-PART_SIZE = 100 * 1024 * 1024
+PART_SIZE = 10 * 1024 * 1024
 MAX_WORKERS = 8
-MAX_RETRIES = 3
-RETRY_BASE = 1.0
+MAX_RETRIES = 5
+RETRY_BASE = 2.0
 BUFFER_SIZE = 1024 * 1024
 
 # (connect, read) timeouts. The read timeout is the max idle gap between bytes,
 # not a total-transfer deadline, so 300s on transfers means "server stopped
 # sending for 5 minutes" — safe for slow part uploads/downloads.
 META_TIMEOUT = (10, 30)
-TRANSFER_TIMEOUT = (10, 300)
+TRANSFER_TIMEOUT = (15, 60)
 
 
 def _fix_host(url: str) -> str:
@@ -103,18 +103,22 @@ def _upload_part(url: str, local_path: str, part_number: int, file_size: int, re
 
         try:
             with _ProgressFile(local_path, start, size, on_read) as body:
-                r = requests.put(url, data=body, timeout=TRANSFER_TIMEOUT)
+                r = requests.put(
+                    url,
+                    data=body,
+                    headers={"Content-Length": str(size)},  # <-- ADD THIS
+                    timeout=TRANSFER_TIMEOUT
+                )
                 r.raise_for_status()
             return {"part_number": part_number, "etag": r.headers["ETag"]}
         except (requests.RequestException, OSError) as e:
             last_err = e
-            report(-sent[0])  # roll back progress so the retry doesn't double-count
+            report(-sent[0])
             if attempt < MAX_RETRIES - 1:
                 _backoff(attempt)
     raise last_err
 
-
-def upload_file(api_base: str, access_key: str, folder: str, local_path: str) -> None:
+def upload_file(api_base: str, access_key: str, folder: str, local_path: str, workers: int = MAX_WORKERS) -> None:
     file_size = os.path.getsize(local_path)
     filename = os.path.basename(local_path)
 
@@ -130,13 +134,17 @@ def upload_file(api_base: str, access_key: str, folder: str, local_path: str) ->
             with bar_lock:
                 bar.update(n)
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
                 ex.submit(_upload_part, p["url"], local_path, p["part_number"], file_size, report)
                 for p in parts
             ]
             for fut in as_completed(futures):
-                completed.append(fut.result())
+                try:
+                    completed.append(fut.result())
+                except Exception as e:
+                    click.echo(f"\npart failed: {e}", err=True)
+                    raise
 
     resp = requests.post(
         f"{api_base}/complete",
@@ -207,7 +215,7 @@ def _download_part_to(out_path: str, url: str, part_number: int, start: int, end
     raise last_err
 
 
-def download_file(data: dict, local_path: str) -> None:
+def download_file(data: dict, local_path: str, workers: int = MAX_WORKERS) -> None:
     parts = data["parts"]
     file_size = data["file_size"]
     total_parts = len(parts)
@@ -240,7 +248,7 @@ def download_file(data: dict, local_path: str) -> None:
     with click.progressbar(length=total_parts, label=label) as bar:
         bar.update(len(done))
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
                 ex.submit(
                     _download_part_to,

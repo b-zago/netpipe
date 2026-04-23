@@ -24,6 +24,7 @@ Thumbs.db
 *.iso
 testfile_*
 *.parts
+*.bin
 
 # Local config / secrets
 .env
