@@ -105,13 +105,20 @@ def init(endpoint, access_key, default_folder):
 @cli.command()
 @click.argument("file_path", type=click.Path(exists=True, dir_okay=False, readable=True))
 @click.option("--folder", "-f", default=None, help="Shared folder to upload into.")
-@click.option("--workers", "-w", default=None, type=click.IntRange(min=1), help="Parallel upload workers (default 8).")
+@click.option("--multi", "-m", is_flag=True, help="Use multipart upload (parallel parts).")
+@click.option("--workers", "-w", default=None, type=click.IntRange(min=1), help="Parallel upload workers for --multi (default 8).")
 @handle_errors
-def send(file_path, folder, workers):
-    """Upload a file to a shared folder."""
+def send(file_path, folder, multi, workers):
+    """Upload a file to a shared folder.
+
+    Uses a single presigned POST by default. Pass --multi to split the file
+    into parts and upload them in parallel (recommended for large files).
+    """
     config = load_config()
     folder = folder or config["default_folder"]
-    kwargs = {"workers": workers} if workers is not None else {}
+    kwargs = {"multipart": multi}
+    if workers is not None:
+        kwargs["workers"] = workers
 
     t0 = time.monotonic()
     api.upload_file(config["endpoint"], config["access_key"], folder, file_path, **kwargs)
@@ -122,18 +129,24 @@ def send(file_path, folder, workers):
 @click.argument("filename")
 @click.option("--folder", "-f", default=None, help="Shared folder to download from.")
 @click.option("--output", "-o", type=click.Path(), help="Where to save the file.")
-@click.option("--workers", "-w", default=None, type=click.IntRange(min=1), help="Parallel download workers (default 8).")
+@click.option("--multi", "-m", is_flag=True, help="Use multipart download (parallel parts).")
+@click.option("--workers", "-w", default=None, type=click.IntRange(min=1), help="Parallel download workers for --multi (default 8).")
 @handle_errors
-def get(filename, folder, output, workers):
-    """Download a file."""
+def get(filename, folder, output, multi, workers):
+    """Download a file.
+
+    Uses a single presigned GET by default. Pass --multi to fetch the file
+    in parallel byte ranges (recommended for large files; supports resume).
+    """
     config = load_config()
     folder = folder or config["default_folder"]
     output = output or filename
-    kwargs = {"workers": workers} if workers is not None else {}
+    kwargs = {"multipart": multi}
+    if workers is not None:
+        kwargs["workers"] = workers
 
     t0 = time.monotonic()
-    data = api.get_download_parts(config["endpoint"], config["access_key"], folder, filename)
-    api.download_file(data, output, **kwargs)
+    api.download_file(config["endpoint"], config["access_key"], folder, filename, output, **kwargs)
     elapsed = time.monotonic() - t0
     click.echo(f"Downloaded {filename} from {folder} in {elapsed:.1f}s")
 

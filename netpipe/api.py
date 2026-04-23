@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
@@ -73,20 +74,24 @@ class _ProgressFile:
         self.close()
 
 
-def initiate_upload(api_base: str, access_key: str, folder: str, filename: str, size: int) -> dict:
+def _request_upload(api_base, access_key, folder, filename, size, multipart):
     resp = requests.put(
         f"{api_base}/send",
         headers={
             "folder-name": folder,
             "file-name": filename,
             "file-size": str(size),
+            "multipart": "true" if multipart else "false",
             "authorization": access_key,
         },
         timeout=META_TIMEOUT,
     )
     resp.raise_for_status()
     data = resp.json()
-    data["parts"] = [{**p, "url": _fix_host(p["url"])} for p in data["parts"]]
+    if multipart:
+        data["parts"] = [{**p, "url": _fix_host(p["url"])} for p in data["parts"]]
+    else:
+        data["url"] = _fix_host(data["url"])
     return data
 
 
@@ -106,8 +111,8 @@ def _upload_part(url: str, local_path: str, part_number: int, file_size: int, re
                 r = requests.put(
                     url,
                     data=body,
-                    headers={"Content-Length": str(size)},  # <-- ADD THIS
-                    timeout=TRANSFER_TIMEOUT
+                    headers={"Content-Length": str(size)},
+                    timeout=TRANSFER_TIMEOUT,
                 )
                 r.raise_for_status()
             return {"part_number": part_number, "etag": r.headers["ETag"]}
@@ -118,11 +123,9 @@ def _upload_part(url: str, local_path: str, part_number: int, file_size: int, re
                 _backoff(attempt)
     raise last_err
 
-def upload_file(api_base: str, access_key: str, folder: str, local_path: str, workers: int = MAX_WORKERS) -> None:
-    file_size = os.path.getsize(local_path)
-    filename = os.path.basename(local_path)
 
-    info = initiate_upload(api_base, access_key, folder, filename, file_size)
+def _upload_multipart(api_base, access_key, folder, filename, local_path, file_size, workers):
+    info = _request_upload(api_base, access_key, folder, filename, file_size, multipart=True)
     upload_id = info["upload_id"]
     parts = info["parts"]
 
@@ -162,12 +165,112 @@ def upload_file(api_base: str, access_key: str, folder: str, local_path: str, wo
     resp.raise_for_status()
 
 
-def get_download_parts(api_base: str, access_key: str, folder: str, filename: str) -> dict:
+class _MultipartStream:
+    """Iterable body for a presigned-POST upload: preamble → file → epilogue.
+
+    Exposes `.len` so `requests` uses Content-Length instead of chunked encoding
+    (S3 rejects chunked encoding on presigned POSTs). Iteration yields 1 MB
+    chunks directly — going through a `read()`-based file-like instead drops
+    throughput roughly in half, because urllib3 pulls in 16 KB chunks and the
+    per-call Python/sendall overhead dominates on a 100 MB upload.
+    """
+
+    CHUNK = 1024 * 1024
+
+    def __init__(self, preamble: bytes, local_path: str, file_size: int,
+                 epilogue: bytes, on_progress) -> None:
+        self._preamble = preamble
+        self._epilogue = epilogue
+        self._local_path = local_path
+        self._file_size = file_size
+        self._on_progress = on_progress
+        self.len = len(preamble) + file_size + len(epilogue)
+
+    def __iter__(self):
+        yield self._preamble
+        remaining = self._file_size
+        with open(self._local_path, "rb") as f:
+            while remaining > 0:
+                chunk = f.read(min(self.CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                self._on_progress(len(chunk))
+                yield chunk
+        yield self._epilogue
+
+
+def _post_single(url, fields, filename, local_path, file_size, on_progress):
+    boundary = uuid.uuid4().hex
+
+    preamble_parts = []
+    for name, value in fields.items():
+        preamble_parts.append(f"--{boundary}\r\n".encode())
+        preamble_parts.append(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        preamble_parts.append(f"{value}\r\n".encode())
+    preamble_parts.append(f"--{boundary}\r\n".encode())
+    preamble_parts.append(
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+    )
+    preamble_parts.append(b"Content-Type: application/octet-stream\r\n\r\n")
+    preamble = b"".join(preamble_parts)
+    epilogue = f"\r\n--{boundary}--\r\n".encode()
+
+    body = _MultipartStream(preamble, local_path, file_size, epilogue, on_progress)
+    r = requests.post(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        timeout=TRANSFER_TIMEOUT,
+    )
+    r.raise_for_status()
+
+
+def _upload_single(api_base, access_key, folder, filename, local_path, file_size):
+    info = _request_upload(api_base, access_key, folder, filename, file_size, multipart=False)
+    url = info["url"]
+    fields = info["fields"]
+
+    with click.progressbar(length=file_size, label=filename, show_pos=True) as bar:
+        last_err = None
+        for attempt in range(MAX_RETRIES):
+            sent = [0]
+
+            def on_progress(n, sent=sent):
+                sent[0] += n
+                bar.update(n)
+
+            try:
+                _post_single(url, fields, filename, local_path, file_size, on_progress)
+                return
+            except (requests.RequestException, OSError) as e:
+                last_err = e
+                bar.update(-sent[0])
+                if attempt < MAX_RETRIES - 1:
+                    _backoff(attempt)
+        raise last_err
+
+
+def upload_file(api_base: str, access_key: str, folder: str, local_path: str,
+                multipart: bool = False, workers: int = MAX_WORKERS) -> None:
+    file_size = os.path.getsize(local_path)
+    filename = os.path.basename(local_path)
+
+    if multipart:
+        _upload_multipart(api_base, access_key, folder, filename, local_path, file_size, workers)
+    else:
+        _upload_single(api_base, access_key, folder, filename, local_path, file_size)
+
+
+def _request_download(api_base, access_key, folder, filename, multipart):
     resp = requests.get(
         f"{api_base}/file",
         headers={
             "folder-name": folder,
             "file-name": filename,
+            "multipart": "true" if multipart else "false",
             "authorization": access_key,
         },
         timeout=META_TIMEOUT,
@@ -178,16 +281,15 @@ def get_download_parts(api_base: str, access_key: str, folder: str, filename: st
         raise FileNotFoundError(resp.json().get("message"))
     resp.raise_for_status()
     data = resp.json()
-    data["parts"] = [{**p, "url": _fix_host(p["url"])} for p in data["parts"]]
+    if multipart:
+        data["parts"] = [{**p, "url": _fix_host(p["url"])} for p in data["parts"]]
+    else:
+        data["url"] = _fix_host(data["url"])
     return data
 
 
 def _download_part_to(out_path: str, url: str, part_number: int, start: int, end: int) -> int:
-    """Download one part directly into `out_path` at byte offset `start`.
-
-    Returns the part_number on success so the caller can record it to the sidecar.
-    The file must already exist at full size (pre-allocated by the caller).
-    """
+    """Download one part directly into `out_path` at byte offset `start`."""
     expected_size = end - start + 1
     headers = {"Range": f"bytes={start}-{end}"}
 
@@ -215,7 +317,7 @@ def _download_part_to(out_path: str, url: str, part_number: int, start: int, end
     raise last_err
 
 
-def download_file(data: dict, local_path: str, workers: int = MAX_WORKERS) -> None:
+def _download_multipart(data: dict, local_path: str, workers: int) -> None:
     parts = data["parts"]
     file_size = data["file_size"]
     total_parts = len(parts)
@@ -267,9 +369,48 @@ def download_file(data: dict, local_path: str, workers: int = MAX_WORKERS) -> No
                         pf.write(f"{part_number}\n")
                 bar.update(1)
 
-    # Full success: drop the sidecar.
     if os.path.exists(progress_path):
         os.remove(progress_path)
+
+
+def _download_single(data: dict, local_path: str) -> None:
+    url = data["url"]
+    file_size = data["file_size"]
+
+    label = f"{os.path.basename(local_path)} ({file_size / (1024*1024):.1f} MB)"
+    with click.progressbar(length=file_size, label=label, show_pos=True) as bar:
+        last_err = None
+        for attempt in range(MAX_RETRIES):
+            written = 0
+            try:
+                with requests.get(url, stream=True, timeout=TRANSFER_TIMEOUT) as r:
+                    r.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=BUFFER_SIZE):
+                            if chunk:
+                                f.write(chunk)
+                                written += len(chunk)
+                                bar.update(len(chunk))
+                if written != file_size:
+                    raise RuntimeError(
+                        f"size mismatch: expected {file_size}, got {written}"
+                    )
+                return
+            except (requests.RequestException, OSError, RuntimeError) as e:
+                last_err = e
+                bar.update(-written)
+                if attempt < MAX_RETRIES - 1:
+                    _backoff(attempt)
+        raise last_err
+
+
+def download_file(api_base: str, access_key: str, folder: str, filename: str, local_path: str,
+                  multipart: bool = False, workers: int = MAX_WORKERS) -> None:
+    data = _request_download(api_base, access_key, folder, filename, multipart)
+    if multipart:
+        _download_multipart(data, local_path, workers)
+    else:
+        _download_single(data, local_path)
 
 
 def list_files(api_base: str, access_key: str, folder: str) -> list[dict]:
