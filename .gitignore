@@ -25,6 +25,7 @@ Thumbs.db
 testfile_*
 *.parts
 *.bin
+*.json
 
 # Local config / secrets
 .env

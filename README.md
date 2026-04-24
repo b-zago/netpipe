@@ -29,6 +29,30 @@ netpipe ls                               # list the default folder
 netpipe ls shared -l                     # long listing
 ```
 
+## Multipart transfers
+
+Both `send` and `get` default to a single-request transfer. For large files, pass `-m` to split the transfer into 10 MB parts uploaded/downloaded in parallel — faster on high-bandwidth links.
+
+```
+netpipe send big.iso -m                  # multipart upload
+netpipe get big.iso -m                   # multipart download (resumable)
+netpipe send big.iso -m -w 16            # override worker count (default 8)
+```
+
+`-w/--workers` only applies with `-m` and sets the number of parallel part transfers.
+
+## Updating config
+
+`netpipe init` overwrites the entire config. To change a single value without re-entering the others, use `config set`:
+
+```
+netpipe config set endpoint https://new.example.com
+netpipe config set key                       # prompts with hidden input
+netpipe config set default shared
+```
+
+Omitting the value prompts for it (the key prompt hides input).
+
 ## Dev mode
 
 Set `NETPIPE_DEV=1` to allow `http://` endpoints and rewrite presigned URL hosts to `localhost` (for LocalStack). Off by default — installed CLI is HTTPS-only.

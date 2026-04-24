@@ -76,7 +76,13 @@ def save_config(config: dict) -> Path:
 @click.group()
 @click.version_option(version=__version__)
 def cli():
-    """Netpipe: send files between friends via AWS."""
+    """Netpipe: send files between friends via AWS.
+
+    Run `netpipe init` once to save your endpoint and access key, then use
+    `send`, `get`, and `ls` to transfer files. Pass `-m` on send/get for
+    parallel multipart transfers on large files. Use `netpipe config set`
+    to update individual settings without re-running init.
+    """
     pass
 
 
@@ -100,6 +106,55 @@ def init(endpoint, access_key, default_folder):
     }
     saved_to = save_config(config)
     click.echo(f"Saved config to {saved_to}")
+
+
+@cli.group()
+def config():
+    """View or update saved configuration."""
+    pass
+
+
+@config.group("set")
+def config_set():
+    """Update a single configuration value."""
+    pass
+
+
+@config_set.command("endpoint")
+@click.argument("value", required=False)
+def config_set_endpoint(value):
+    """Update the API endpoint."""
+    if value is None:
+        value = click.prompt("API endpoint")
+    _check_endpoint(value)
+    cfg = load_config()
+    cfg["endpoint"] = value
+    path = save_config(cfg)
+    click.echo(f"Updated endpoint. Saved to {path}")
+
+
+@config_set.command("key")
+@click.argument("value", required=False)
+def config_set_key(value):
+    """Update the access key."""
+    if value is None:
+        value = click.prompt("Access key", hide_input=True)
+    cfg = load_config()
+    cfg["access_key"] = value
+    path = save_config(cfg)
+    click.echo(f"Updated access key. Saved to {path}")
+
+
+@config_set.command("default")
+@click.argument("value", required=False)
+def config_set_default(value):
+    """Update the default folder."""
+    if value is None:
+        value = click.prompt("Default folder")
+    cfg = load_config()
+    cfg["default_folder"] = value
+    path = save_config(cfg)
+    click.echo(f"Updated default folder. Saved to {path}")
 
 
 @cli.command()

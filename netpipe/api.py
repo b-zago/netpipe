@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -12,6 +13,48 @@ import requests
 # HTTPS enforcement check, and presigned URL hosts that come back as raw
 # container IPs get rewritten to localhost. Default is False (prod-safe).
 DEV = os.environ.get("NETPIPE_DEV", "").lower() in ("1", "true", "yes")
+
+
+class _Progress:
+    """Minimal progress bar tuned for VHS.
+
+    click.progressbar auto-sizes to the terminal, which under VHS can exceed
+    the actual render width and wrap — after which \\r returns to the start of
+    the wrapped line, not the bar, so each update looks like a new line. This
+    writes a fixed-width line (~55 chars) to stdout with \\x1b[2K\\r so VHS
+    always has enough room and repaints cleanly.
+    """
+    _BAR_WIDTH = 30
+
+    def __init__(self, length, label):
+        self.length = length
+        self.label = label
+        self.pos = 0
+        self._lock = threading.Lock()
+        self._render()
+
+    def update(self, n):
+        with self._lock:
+            self.pos = max(0, min(self.pos + n, self.length))
+            self._render()
+
+    def _render(self):
+        pct = (self.pos / self.length) if self.length else 0
+        filled = int(self._BAR_WIDTH * pct)
+        bar = "=" * filled + " " * (self._BAR_WIDTH - filled)
+        mb_done = self.pos / (1024 * 1024)
+        mb_total = self.length / (1024 * 1024)
+        sys.stdout.write(f"\x1b[2K\r{self.label} [{bar}] {mb_done:5.1f}/{mb_total:.1f} MB")
+        sys.stdout.flush()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
 PART_SIZE = 10 * 1024 * 1024
 MAX_WORKERS = 8
 MAX_RETRIES = 5
@@ -130,12 +173,10 @@ def _upload_multipart(api_base, access_key, folder, filename, local_path, file_s
     parts = info["parts"]
 
     completed = []
-    bar_lock = threading.Lock()
 
-    with click.progressbar(length=file_size, label=filename, show_pos=True) as bar:
+    with _Progress(file_size, filename) as bar:
         def report(n):
-            with bar_lock:
-                bar.update(n)
+            bar.update(n)
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
@@ -233,7 +274,7 @@ def _upload_single(api_base, access_key, folder, filename, local_path, file_size
     url = info["url"]
     fields = info["fields"]
 
-    with click.progressbar(length=file_size, label=filename, show_pos=True) as bar:
+    with _Progress(file_size, filename) as bar:
         last_err = None
         for attempt in range(MAX_RETRIES):
             sent = [0]
@@ -320,7 +361,6 @@ def _download_part_to(out_path: str, url: str, part_number: int, start: int, end
 def _download_multipart(data: dict, local_path: str, workers: int) -> None:
     parts = data["parts"]
     file_size = data["file_size"]
-    total_parts = len(parts)
     progress_path = f"{local_path}.parts"
 
     # Cross-run resume: sidecar lists part numbers already written. We only
@@ -345,10 +385,11 @@ def _download_multipart(data: dict, local_path: str, workers: int) -> None:
 
     pending = [p for p in parts if p["part_number"] not in done]
     sidecar_lock = threading.Lock()
+    part_sizes = {p["part_number"]: p["end"] - p["start"] + 1 for p in parts}
 
-    label = f"{os.path.basename(local_path)} ({file_size / (1024*1024):.1f} MB)"
-    with click.progressbar(length=total_parts, label=label) as bar:
-        bar.update(len(done))
+    label = os.path.basename(local_path)
+    with _Progress(file_size, label) as bar:
+        bar.update(sum(part_sizes[pn] for pn in done))
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
@@ -367,7 +408,7 @@ def _download_multipart(data: dict, local_path: str, workers: int) -> None:
                 with sidecar_lock:
                     with open(progress_path, "a") as pf:
                         pf.write(f"{part_number}\n")
-                bar.update(1)
+                bar.update(part_sizes[part_number])
 
     if os.path.exists(progress_path):
         os.remove(progress_path)
@@ -377,8 +418,8 @@ def _download_single(data: dict, local_path: str) -> None:
     url = data["url"]
     file_size = data["file_size"]
 
-    label = f"{os.path.basename(local_path)} ({file_size / (1024*1024):.1f} MB)"
-    with click.progressbar(length=file_size, label=label, show_pos=True) as bar:
+    label = os.path.basename(local_path)
+    with _Progress(file_size, label) as bar:
         last_err = None
         for attempt in range(MAX_RETRIES):
             written = 0
