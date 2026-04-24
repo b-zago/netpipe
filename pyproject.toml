@@ -1,6 +1,6 @@
 [project]
 name = "netpipe"
-version = "0.3.0"
+version = "0.4.0"
 description = "Send files between friends via AWS"
 readme = "README.md"
 requires-python = ">=3.10"
